@@ -184,10 +184,38 @@ if args.mode == 'dream':
     else:
         image = Image.fromarray((np.random.random((512, 512, 3)) * 255).astype(np.uint8))
     
-    if args.layerid is not None:
-        expdir = f"dream/layer{args.layerid}"
-        os.makedirs(expdir, exist_ok=True)
+    expdir = "dream"
+    os.makedirs(expdir, exist_ok=True)
 
+    if args.layerid is not None and args.filterid is not None:
+        # dream specific filter
+        all_layers = list(network.cnn.children())
+        model = nn.Sequential(*all_layers[: (args.layerid + 1)])
+        if torch.cuda.is_available:
+            model = model.cuda()
+
+        dreamed_image = deep_dream(
+            image,
+            model,
+            iterations=args.iterations,
+            lr=args.lr,
+            octave_scale=args.octave_scale,
+            num_octaves=args.num_octaves,
+            filterid=args.filterid
+        )
+
+        activation = model(Tensor(dreamed_image).unsqueeze(0).permute(0, 3, 1, 2).cuda()).detach().cpu()[0, args.filterid]
+        activation = nd.zoom(activation, dreamed_image.shape[0] / activation.shape[0])
+        activation = (activation - activation.min()) / (activation.max() - activation.min() + 1e-8)
+        activation = np.tile(activation[:, :, np.newaxis], (1, 1, 3))
+
+        plt.figure(figsize=(8, 8))
+        plt.imshow(dreamed_image)
+        plt.imshow(activation, alpha=0.3)
+        plt.annotate(args.filterid, (0, 0))
+        plt.savefig(os.path.join(expdir, f"layer{args.layerid}_filter{args.filterid}.jpg"))
+
+    elif args.layerid is not None:
         # dream all filters in the specified layer
         all_layers = list(network.cnn.children())
         model = nn.Sequential(*all_layers[: (args.layerid + 1)])
@@ -213,7 +241,14 @@ if args.mode == 'dream':
                 num_octaves=args.num_octaves,
                 filterid=filterid
             )
+
+            activation = model(Tensor(dreamed_image).unsqueeze(0).permute(0, 3, 1, 2).cuda()).detach().cpu()[0, filterid]
+            activation = nd.zoom(activation, dreamed_image.shape[0] / activation.shape[0])
+            activation = (activation - activation.min()) / (activation.max() - activation.min() + 1e-8)
+            activation = np.tile(activation[:, :, np.newaxis], (1, 1, 3))
+
             axs[filterid].imshow(dreamed_image)
+            axs[filterid].imshow(activation, alpha=0.3)
             axs[filterid].annotate(filterid, (0, 0), fontsize=15)
 
         plt.savefig(f"{expdir}/filters_layer{args.layerid}.jpg")

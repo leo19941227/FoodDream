@@ -14,14 +14,27 @@ from torch.utils.data import Dataset
 import torchvision.transforms as transforms
 from skimage.segmentation import slic
 from lime import lime_image
-from pdb import set_trace
+from ipdb import set_trace
+from torch.autograd import Variable
+import tqdm
+import scipy.ndimage as nd
+from utils import deprocess, preprocess, clip
 
 """Argument parsing"""
-args = {
-      'ckptpath': './checkpoint.pth',
-      'dataset_dir': './food-11/'
-}
-args = argparse.Namespace(**args)
+parser = argparse.ArgumentParser()
+parser.add_argument("--iterations", default=20, type=int, help="number of gradient ascent steps per octave")
+parser.add_argument("--at_layer", default=27, type=int, help="layer at which we modify image to maximize outputs")
+parser.add_argument("--filterid", type=int)
+parser.add_argument("--lr", default=0.01, type=float, help="learning rate")
+parser.add_argument("--octave_scale", default=1.4, help="image scale between octaves")
+parser.add_argument("--num_octaves", default=10, help="number of octaves")
+parser.add_argument("--ckptpath", default="./checkpoint.pth")
+parser.add_argument("--dataset_dir", default="./food-11/")
+parser.add_argument("--filename", default="0-0")
+parser.add_argument("--split", default="evaluation")
+parser.add_argument("--from_noise", action="store_true")
+args = parser.parse_args()
+
 
 """Model definition and checkpoint loading"""
 class Classifier(nn.Module):
@@ -62,9 +75,10 @@ class Classifier(nn.Module):
     out = out.view(out.size()[0], -1)
     return self.fc(out)
 
-model = Classifier().cuda()
+network = Classifier().cuda()
 checkpoint = torch.load(args.ckptpath)
-model.load_state_dict(checkpoint['model_state_dict'])
+network.load_state_dict(checkpoint['model_state_dict'])
+
 
 """Dataset definition and creation"""
 class FoodDataset(Dataset):
@@ -112,51 +126,88 @@ def get_paths_labels(path):
         imgpaths.append(os.path.join(path, name))
         labels.append(int(name.split('_')[0]))
     return imgpaths, labels
-train_paths, train_labels = get_paths_labels(os.path.join(args.dataset_dir, 'training'))
-train_set = FoodDataset(train_paths, train_labels, mode='eval')
+paths, labels = get_paths_labels(os.path.join(args.dataset_dir, args.split))
+dataset = FoodDataset(paths, labels, mode='eval')
 
 
 """Filter explaination"""
-def normalize(image):
-  return (image - image.min()) / (image.max() - image.min())
+def dream(image, model, iterations, lr, filterid=None):
+    """ Updates the image to maximize outputs for n iterations """
+    Tensor = torch.cuda.FloatTensor if torch.cuda.is_available else torch.FloatTensor
+    image = Variable(Tensor(image), requires_grad=True)
+    for i in range(iterations):
+        model.zero_grad()
+        out = model(image)
+        if filterid is not None:
+            out = out[:, filterid, :, :]
+        loss = out.norm()
+        loss.backward()
+        avg_grad = np.abs(image.grad.data.cpu().numpy()).mean()
+        norm_lr = lr / avg_grad
+        image.data += norm_lr * image.grad.data
+        image.data = clip(image.data)
+        image.grad.data.zero_()
+    return image.cpu().data.numpy()
 
-layer_activations = None
-def filter_explaination(x, model, cnnid, filterid, iteration=100, lr=1):
-  model.eval()
 
-  def hook(model, input, output):
-    global layer_activations
-    layer_activations = output
+def deep_dream(image, model, iterations, lr, octave_scale, num_octaves, filterid=None):
+    """ Main deep dream method """
+    image = preprocess(image).unsqueeze(0).cpu().data.numpy()
 
-  hook_handle = model.cnn[cnnid].register_forward_hook(hook)
-  model(x.cuda())
-  filter_activations = layer_activations[:, filterid, :, :].detach().cpu()
-  x = torch.rand(1, 3, 128, 128).cuda()
-  x.requires_grad_()
-  optimizer = Adam([x], lr=lr)
-  for iter in range(iteration):
-    optimizer.zero_grad()
-    model(x)
+    # Extract image representations for each octave
+    octaves = [image]
+    for _ in range(num_octaves - 1):
+        octaves.append(nd.zoom(octaves[-1], (1, 1, 1 / octave_scale, 1 / octave_scale), order=1))
 
-    objective = -layer_activations[:, filterid, :, :].abs().sum()
-    objective.backward()
-    optimizer.step()
-  filter_visualization = x.detach().cpu().squeeze()
-  hook_handle.remove()
+    detail = np.zeros_like(octaves[-1])
+    for octave, octave_base in enumerate(tqdm.tqdm(octaves[::-1], desc="Dreaming")):
+        if octave > 0:
+            # Upsample detail to new octave dimension
+            detail = nd.zoom(detail, np.array(octave_base.shape) / np.array(detail.shape), order=1)
+        # Add deep dream detail from previous octave to new base
+        input_image = octave_base + detail
+        # Get new deep dream image
+        dreamed_image = dream(input_image, model, iterations, lr, filterid=filterid)
+        # Extract deep dream details
+        detail = dreamed_image - octave_base
 
-  return filter_activations, filter_visualization
+    return deprocess(dreamed_image)
 
-img_indices = [83, 4218, 4707, 8598]
-images, labels = train_set.getbatch(img_indices)
-filter_activations, filter_visualization = filter_explaination(images, model, cnnid=15, filterid=0, iteration=1000, lr=0.1)
 
-plt.figure(figsize=(15, 8))
-plt.imshow(normalize(filter_visualization.permute(1, 2, 0)))
-plt.savefig('filter_visualization.png')
+# Load image
+if not args.from_noise:
+    expdir = f"outputs/{args.filename}"
+    input_image = os.path.join(args.dataset_dir, args.split, f'{args.filename}.jpg')
+    image = Image.open(input_image)
+else:
+    expdir = f"outputs/noise"
+    image = Image.fromarray((np.random.random((512, 512, 3)) * 255).astype(np.uint8))
+os.makedirs(expdir, exist_ok=True)
 
-fig, axs = plt.subplots(2, len(img_indices), figsize=(15, 8))
-for i, img in enumerate(images):
-  axs[0][i].imshow(img.permute(1, 2, 0))
-for i, img in enumerate(filter_activations):
-  axs[1][i].imshow(normalize(img))
-plt.savefig('filter_activation.png')
+# before
+plt.figure(figsize=(20, 20))
+plt.imsave(f"{expdir}/0.jpg", np.array(image))
+plt.close()
+
+# Define the model
+print(network)
+layers = list(network.cnn.children())
+model = nn.Sequential(*layers[: (args.at_layer + 1)])
+if torch.cuda.is_available:
+    model = model.cuda()
+
+# Extract deep dream image
+dreamed_image = deep_dream(
+    image,
+    model,
+    iterations=args.iterations,
+    lr=args.lr,
+    octave_scale=args.octave_scale,
+    num_octaves=args.num_octaves,
+    filterid=args.filterid
+)
+
+# after
+plt.figure(figsize=(20, 20))
+plt.imsave(f"{expdir}/{args.at_layer}.jpg", dreamed_image)
+plt.close()

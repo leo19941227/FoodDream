@@ -25,9 +25,9 @@ from utils import deprocess, preprocess, clip
 """Argument parsing"""
 parser = argparse.ArgumentParser()
 parser.add_argument("--iterations", default=20, type=int, help="number of gradient ascent steps per octave")
-parser.add_argument("--lr", default=0.01, type=float, help="learning rate")
-parser.add_argument("--octave_scale", default=1.4, type=float, help="image scale between octaves")
-parser.add_argument("--num_octaves", default=10, type=int, help="number of octaves")
+parser.add_argument("--lr", default=0.1, type=float, help="learning rate")
+parser.add_argument("--octave_scale", default=1.2, type=float, help="image scale between octaves")
+parser.add_argument("--num_octaves", default=12, type=int, help="number of octaves")
 parser.add_argument("--ckptpath", default="./checkpoint.pth")
 parser.add_argument("--dataset_dir", default="./food-11/")
 parser.add_argument("--filename", default="0-0")

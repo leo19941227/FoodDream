@@ -37,6 +37,7 @@ parser.add_argument("--filename")
 parser.add_argument("--layers", default="2,5,8,12,15,18,22,25,28,32")
 parser.add_argument("--layerid", type=int)
 parser.add_argument("--filterid", type=int)
+parser.add_argument("--alpha", default=0.5, type=float)
 args = parser.parse_args()
 
 
@@ -207,11 +208,12 @@ if args.mode == 'dream':
         activation = model(Tensor(dreamed_image).unsqueeze(0).permute(0, 3, 1, 2).cuda()).detach().cpu()[0, args.filterid]
         activation = nd.zoom(activation, dreamed_image.shape[0] / activation.shape[0])
         activation = (activation - activation.min()) / (activation.max() - activation.min() + 1e-8)
-        activation = np.tile(activation[:, :, np.newaxis], (1, 1, 3))
+        activation = torch.FloatTensor(activation)
+        activation = torch.stack([activation, activation, torch.zeros_like(activation)]).permute(1, 2, 0)
 
         plt.figure(figsize=(8, 8))
         plt.imshow(dreamed_image)
-        plt.imshow(activation, alpha=0.3)
+        plt.imshow(activation, alpha=args.alpha)
         plt.annotate(args.filterid, (0, 0))
         plt.savefig(os.path.join(expdir, f"layer{args.layerid}_filter{args.filterid}.jpg"))
 
@@ -245,10 +247,11 @@ if args.mode == 'dream':
             activation = model(Tensor(dreamed_image).unsqueeze(0).permute(0, 3, 1, 2).cuda()).detach().cpu()[0, filterid]
             activation = nd.zoom(activation, dreamed_image.shape[0] / activation.shape[0])
             activation = (activation - activation.min()) / (activation.max() - activation.min() + 1e-8)
-            activation = np.tile(activation[:, :, np.newaxis], (1, 1, 3))
+            activation = torch.FloatTensor(activation)
+            activation = torch.stack([activation, activation, torch.zeros_like(activation)]).permute(1, 2, 0)
 
             axs[filterid].imshow(dreamed_image)
-            axs[filterid].imshow(activation, alpha=0.3)
+            axs[filterid].imshow(activation, alpha=args.alpha)
             axs[filterid].annotate(filterid, (0, 0), fontsize=15)
 
         plt.savefig(f"{expdir}/filters_layer{args.layerid}.jpg")
@@ -285,6 +288,9 @@ if args.mode == 'dream':
         plt.close()
 
 elif args.mode == 'activation':
+    assert args.layerid is not None
+    assert args.filterid is not None
+
     all_layers = list(network.cnn.children())
     model = nn.Sequential(*all_layers[: (args.layerid + 1)])
     if torch.cuda.is_available:
@@ -293,17 +299,25 @@ elif args.mode == 'activation':
     activations = []
     for img, label in tqdm.tqdm(dataset):
         out = model(img.unsqueeze(0).cuda())
-        activation = out[:, args.filterid, :, :][0].norm()
-        activations.append((img, activation.item()))
+        activation = out[:, args.filterid, :, :][0].detach().cpu()
+        activations.append((img, activation, activation.norm().item()))
     
-    activations_sorted = sorted(activations, key=lambda x: x[1], reverse=True)
+    activations_sorted = sorted(activations, key=lambda x: x[2], reverse=True)
     
     n_row = 10
     fig, axs = plt.subplots(n_row, n_row, figsize=(n_row * 10, n_row * 10))
     axs = [axs[i, j] for i, j in itertools.product(range(n_row), range(n_row))]
     for i in range(n_row * n_row):
-        axs[i].imshow(activations_sorted[i][0].permute(1, 2, 0))
-    
+        img = activations_sorted[i][0].permute(1, 2, 0)
+        activation = activations_sorted[i][1]
+        activation = torch.FloatTensor(nd.zoom(activation.numpy(), img.size(0) / activation.size(0)))
+        activation = (activation - activation.min()) / (activation.max() - activation.min() + 1e-8)
+        activation = torch.stack([activation, activation, torch.zeros_like(activation)]).permute(1, 2, 0)
+
+        axs[i].imshow(img)
+        axs[i].imshow(activation, alpha=args.alpha)
+        axs[i].annotate(activations_sorted[i][2], (0, 0))
+
     expdir = 'activations'
     os.makedirs(expdir, exist_ok=True)
     plt.savefig(os.path.join(expdir, f'layer{args.layerid}_filter{args.filterid}.jpg'))

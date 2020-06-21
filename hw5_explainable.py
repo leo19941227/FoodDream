@@ -21,19 +21,22 @@ from torch.autograd import Variable
 import tqdm
 import scipy.ndimage as nd
 from utils import deprocess, preprocess, clip
+Tensor = torch.cuda.FloatTensor if torch.cuda.is_available else torch.FloatTensor
 
 """Argument parsing"""
 parser = argparse.ArgumentParser()
+parser.add_argument("--mode", required=True)
 parser.add_argument("--iterations", default=20, type=int, help="number of gradient ascent steps per octave")
 parser.add_argument("--lr", default=0.1, type=float, help="learning rate")
 parser.add_argument("--octave_scale", default=1.2, type=float, help="image scale between octaves")
 parser.add_argument("--num_octaves", default=12, type=int, help="number of octaves")
 parser.add_argument("--ckptpath", default="./checkpoint.pth")
 parser.add_argument("--dataset_dir", default="./food-11/")
-parser.add_argument("--filename", default="0-0")
 parser.add_argument("--split", default="evaluation")
-parser.add_argument("--from_noise", action="store_true")
+parser.add_argument("--filename")
 parser.add_argument("--layers", default="2,5,8,12,15,18,22,25,28,32")
+parser.add_argument("--layerid", type=int)
+parser.add_argument("--filterid", type=int)
 args = parser.parse_args()
 
 
@@ -132,13 +135,14 @@ dataset = FoodDataset(paths, labels, mode='eval')
 
 
 """Filter explaination"""
-def dream(image, model, iterations, lr):
+def dream(image, model, iterations, lr, filterid=None):
     """ Updates the image to maximize outputs for n iterations """
-    Tensor = torch.cuda.FloatTensor if torch.cuda.is_available else torch.FloatTensor
     image = Variable(Tensor(image), requires_grad=True)
     for i in range(iterations):
         model.zero_grad()
         out = model(image)
+        if filterid is not None:
+            out = out[:, filterid, :, :]
         loss = out.norm()
         loss.backward()
         avg_grad = np.abs(image.grad.data.cpu().numpy()).mean()
@@ -149,7 +153,7 @@ def dream(image, model, iterations, lr):
     return image.cpu().data.numpy()
 
 
-def deep_dream(image, model, iterations, lr, octave_scale, num_octaves):
+def deep_dream(image, model, iterations, lr, octave_scale, num_octaves, filterid=None):
     """ Main deep dream method """
     image = preprocess(image).unsqueeze(0).cpu().data.numpy()
 
@@ -166,48 +170,105 @@ def deep_dream(image, model, iterations, lr, octave_scale, num_octaves):
         # Add deep dream detail from previous octave to new base
         input_image = octave_base + detail
         # Get new deep dream image
-        dreamed_image = dream(input_image, model, iterations, lr)
+        dreamed_image = dream(input_image, model, iterations, lr, filterid=filterid)
         # Extract deep dream details
         detail = dreamed_image - octave_base
 
     return deprocess(dreamed_image)
 
 
-# Load image
-if not args.from_noise:
-    expdir = f"outputs/{args.filename}"
-    input_image = os.path.join(args.dataset_dir, args.split, f'{args.filename}.jpg')
-    image = Image.open(input_image)
-else:
-    expdir = f"outputs/noise"
-    image = Image.fromarray((np.random.random((512, 512, 3)) * 255).astype(np.uint8))
-os.makedirs(expdir, exist_ok=True)
+if args.mode == 'dream':
+    if args.filename is not None:
+        input_image = os.path.join(args.dataset_dir, args.split, f'{args.filename}.jpg')
+        image = Image.open(input_image)
+    else:
+        image = Image.fromarray((np.random.random((512, 512, 3)) * 255).astype(np.uint8))
+    
+    if args.layerid is not None:
+        expdir = f"dream/layer{args.layerid}"
+        os.makedirs(expdir, exist_ok=True)
 
-layers = [int(idx) for idx in args.layers.split(',')]
-n_grid = len(layers) + 1
-n_row = math.ceil(math.sqrt(n_grid))
-fig, axs = plt.subplots(n_row, n_row, figsize=(n_row * 10, n_row * 10))
-axs = [axs[i, j] for i, j in itertools.product(range(n_row), range(n_row))]
-axs[0].imshow(np.array(image))
+        # dream all filters in the specified layer
+        all_layers = list(network.cnn.children())
+        model = nn.Sequential(*all_layers[: (args.layerid + 1)])
+        if torch.cuda.is_available:
+            model = model.cuda()
+        
+        with torch.no_grad():
+            imgtmp = preprocess(image).unsqueeze(0).cpu().data.numpy()
+            filter_num = model(Tensor(imgtmp)).size(1)
 
-for idx, at_layer in enumerate(layers):
-    print(f"Processing layer {at_layer}")
+        unit = 5
+        n_row = math.ceil(math.sqrt(filter_num))
+        fig, axs = plt.subplots(n_row, n_row, figsize=(n_row * unit, n_row * unit))
+        axs = [axs[i, j] for i, j in itertools.product(range(n_row), range(n_row))]
+
+        for filterid in tqdm.tqdm(range(filter_num)):
+            dreamed_image = deep_dream(
+                image,
+                model,
+                iterations=args.iterations,
+                lr=args.lr,
+                octave_scale=args.octave_scale,
+                num_octaves=args.num_octaves,
+                filterid=filterid
+            )
+            axs[filterid].imshow(dreamed_image)
+            axs[filterid].annotate(filterid, (0, 0), fontsize=15)
+
+        plt.savefig(f"{expdir}/filters_layer{args.layerid}.jpg")
+        
+    else:
+        # dream all layers
+        unit = 10
+        layers = [int(idx) for idx in args.layers.split(',')]
+        n_row = math.ceil(math.sqrt(len(layers) + 1))
+        fig, axs = plt.subplots(n_row, n_row, figsize=(n_row * unit, n_row * unit))
+        axs = [axs[i, j] for i, j in itertools.product(range(n_row), range(n_row))]
+        axs[0].imshow(np.array(image))
+
+        for idx, layerid in enumerate(layers):
+            print(f"Processing layer {layerid}")
+            all_layers = list(network.cnn.children())
+            model = nn.Sequential(*all_layers[: (layerid + 1)])
+            if torch.cuda.is_available:
+                model = model.cuda()
+
+            dreamed_image = deep_dream(
+                image,
+                model,
+                iterations=args.iterations,
+                lr=args.lr,
+                octave_scale=args.octave_scale,
+                num_octaves=args.num_octaves,
+            )
+
+            axs[idx + 1].imshow(dreamed_image)
+            axs[idx + 1].annotate(layerid, (0, 0), fontsize=15)
+
+        plt.savefig(f"{expdir}/layers.jpg")
+        plt.close()
+
+elif args.mode == 'activation':
     all_layers = list(network.cnn.children())
-    model = nn.Sequential(*all_layers[: (at_layer + 1)])
+    model = nn.Sequential(*all_layers[: (args.layerid + 1)])
     if torch.cuda.is_available:
         model = model.cuda()
-
-    # Extract deep dream image
-    dreamed_image = deep_dream(
-        image,
-        model,
-        iterations=args.iterations,
-        lr=args.lr,
-        octave_scale=args.octave_scale,
-        num_octaves=args.num_octaves,
-    )
-
-    axs[idx + 1].imshow(dreamed_image)
-
-plt.savefig(f"{expdir}/summary.jpg")
-plt.close()
+    
+    activations = []
+    for img, label in tqdm.tqdm(dataset):
+        out = model(img.unsqueeze(0).cuda())
+        activation = out[:, args.filterid, :, :][0].norm()
+        activations.append((img, activation.item()))
+    
+    activations_sorted = sorted(activations, key=lambda x: x[1], reverse=True)
+    
+    n_row = 10
+    fig, axs = plt.subplots(n_row, n_row, figsize=(n_row * 10, n_row * 10))
+    axs = [axs[i, j] for i, j in itertools.product(range(n_row), range(n_row))]
+    for i in range(n_row * n_row):
+        axs[i].imshow(activations_sorted[i][0].permute(1, 2, 0))
+    
+    expdir = 'activations'
+    os.makedirs(expdir, exist_ok=True)
+    plt.savefig(os.path.join(expdir, f'layer{args.layerid}_filter{args.filterid}.jpg'))

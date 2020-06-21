@@ -2,7 +2,9 @@
 
 import os
 import sys
+import math
 import argparse
+import itertools
 import numpy as np
 from PIL import Image
 import matplotlib.pyplot as plt
@@ -23,16 +25,15 @@ from utils import deprocess, preprocess, clip
 """Argument parsing"""
 parser = argparse.ArgumentParser()
 parser.add_argument("--iterations", default=20, type=int, help="number of gradient ascent steps per octave")
-parser.add_argument("--at_layer", default=27, type=int, help="layer at which we modify image to maximize outputs")
-parser.add_argument("--filterid", type=int)
 parser.add_argument("--lr", default=0.01, type=float, help="learning rate")
-parser.add_argument("--octave_scale", default=1.4, help="image scale between octaves")
-parser.add_argument("--num_octaves", default=10, help="number of octaves")
+parser.add_argument("--octave_scale", default=1.4, type=float, help="image scale between octaves")
+parser.add_argument("--num_octaves", default=10, type=int, help="number of octaves")
 parser.add_argument("--ckptpath", default="./checkpoint.pth")
 parser.add_argument("--dataset_dir", default="./food-11/")
 parser.add_argument("--filename", default="0-0")
 parser.add_argument("--split", default="evaluation")
 parser.add_argument("--from_noise", action="store_true")
+parser.add_argument("--layers", default="2,5,8,12,15,18,22,25,28,32")
 args = parser.parse_args()
 
 
@@ -131,15 +132,13 @@ dataset = FoodDataset(paths, labels, mode='eval')
 
 
 """Filter explaination"""
-def dream(image, model, iterations, lr, filterid=None):
+def dream(image, model, iterations, lr):
     """ Updates the image to maximize outputs for n iterations """
     Tensor = torch.cuda.FloatTensor if torch.cuda.is_available else torch.FloatTensor
     image = Variable(Tensor(image), requires_grad=True)
     for i in range(iterations):
         model.zero_grad()
         out = model(image)
-        if filterid is not None:
-            out = out[:, filterid, :, :]
         loss = out.norm()
         loss.backward()
         avg_grad = np.abs(image.grad.data.cpu().numpy()).mean()
@@ -150,7 +149,7 @@ def dream(image, model, iterations, lr, filterid=None):
     return image.cpu().data.numpy()
 
 
-def deep_dream(image, model, iterations, lr, octave_scale, num_octaves, filterid=None):
+def deep_dream(image, model, iterations, lr, octave_scale, num_octaves):
     """ Main deep dream method """
     image = preprocess(image).unsqueeze(0).cpu().data.numpy()
 
@@ -167,7 +166,7 @@ def deep_dream(image, model, iterations, lr, octave_scale, num_octaves, filterid
         # Add deep dream detail from previous octave to new base
         input_image = octave_base + detail
         # Get new deep dream image
-        dreamed_image = dream(input_image, model, iterations, lr, filterid=filterid)
+        dreamed_image = dream(input_image, model, iterations, lr)
         # Extract deep dream details
         detail = dreamed_image - octave_base
 
@@ -184,30 +183,31 @@ else:
     image = Image.fromarray((np.random.random((512, 512, 3)) * 255).astype(np.uint8))
 os.makedirs(expdir, exist_ok=True)
 
-# before
-plt.figure(figsize=(20, 20))
-plt.imsave(f"{expdir}/0.jpg", np.array(image))
-plt.close()
+layers = [int(idx) for idx in args.layers.split(',')]
+n_grid = len(layers) + 1
+n_row = math.ceil(math.sqrt(n_grid))
+fig, axs = plt.subplots(n_row, n_row, figsize=(n_row * 10, n_row * 10))
+axs = [axs[i, j] for i, j in itertools.product(range(n_row), range(n_row))]
+axs[0].imshow(np.array(image))
 
-# Define the model
-print(network)
-layers = list(network.cnn.children())
-model = nn.Sequential(*layers[: (args.at_layer + 1)])
-if torch.cuda.is_available:
-    model = model.cuda()
+for idx, at_layer in enumerate(layers):
+    print(f"Processing layer {at_layer}")
+    all_layers = list(network.cnn.children())
+    model = nn.Sequential(*all_layers[: (at_layer + 1)])
+    if torch.cuda.is_available:
+        model = model.cuda()
 
-# Extract deep dream image
-dreamed_image = deep_dream(
-    image,
-    model,
-    iterations=args.iterations,
-    lr=args.lr,
-    octave_scale=args.octave_scale,
-    num_octaves=args.num_octaves,
-    filterid=args.filterid
-)
+    # Extract deep dream image
+    dreamed_image = deep_dream(
+        image,
+        model,
+        iterations=args.iterations,
+        lr=args.lr,
+        octave_scale=args.octave_scale,
+        num_octaves=args.num_octaves,
+    )
 
-# after
-plt.figure(figsize=(20, 20))
-plt.imsave(f"{expdir}/{args.at_layer}.jpg", dreamed_image)
+    axs[idx + 1].imshow(dreamed_image)
+
+plt.savefig(f"{expdir}/summary.jpg")
 plt.close()
